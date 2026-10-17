@@ -4322,6 +4322,20 @@ void SatoriRecycler::PlanRegions(SatoriRegionQueue* regions)
             else
             {
                 size_t reclaim = curRegion->ReclaimSizeIfRelocated(m_promoteAllRegions);
+
+                // forced compaction in gen2 also relocates regions more than half full, in parts.
+                // these go last, to fill the free spans that the other relocations leave.
+                if (!reclaim && (m_forceCompact || SatoriUtil::IsForceCompact()) && m_condemnedGeneration == 2)
+                {
+                    reclaim = curRegion->ReclaimSizeIfRelocatedInParts();
+                    if (reclaim)
+                    {
+                        Interlocked::ExchangeAdd64(&m_estimatedEphemeralReclaim, reclaim);
+                        m_relocatingRegions->Enqueue(curRegion);
+                        continue;
+                    }
+                }
+
                 if (reclaim)
                 {
                     // we use m_estimatedEphemeralReclaim to accumulate current estimate
@@ -4512,6 +4526,13 @@ void SatoriRecycler::RelocateRegion(SatoriRegion* relocationSource)
 
     size_t maxBytesToCopy = relocationSource->Occupancy();
 
+    // a region more than half full does not fit a free span of another region.
+    // when it cannot be split, it goes to a new region as a whole, and the rest of that region takes the next parts.
+    if (maxBytesToCopy > Satori::REGION_SIZE_GRANULARITY / 2 && RelocateRegionInParts(relocationSource))
+    {
+        return;
+    }
+
     // If the region could be used as a target for itself,
     // there could be more like this, do not ask for a free region.
     // We would rather make this one a target of relocations.
@@ -4557,45 +4578,9 @@ void SatoriRecycler::RelocateRegion(SatoriRegion* relocationSource)
 
     // actually relocate src objects into the allocated space.
     size_t dstOrig = dst;
-    size_t objLimit = relocationSource->Start() + Satori::REGION_SIZE_GRANULARITY;
-    SatoriObject* o = relocationSource->FirstObject();
-
-    // the target is typically marked, unless it is freshly allocated or in a higher generation
-    // preserve marked state by copying marks
     bool relocationIsPromotion = relocationTarget->Generation() > m_condemnedGeneration;
-    bool needToCopyMarks = !(relocationIsPromotion || relocationTarget->DoNotSweep());
-    _ASSERTE(relocationTarget->HasMarksSet() == needToCopyMarks);
-
-    int32_t objectsRelocated = 0;
-    do
-    {
-        o = relocationSource->SkipUnmarked(o);
-        if (o->Start() >= objLimit)
-        {
-            _ASSERTE(o->Start() == objLimit);
-            break;
-        }
-
-        _ASSERTE(o->IsMarked());
-        _ASSERTE(!o->IsFree());
-        _ASSERTE(!o->IsUnmovable());
-
-        size_t size = o->Size();
-        memcpy((void*)(dst - sizeof(size_t)), (void*)(o->Start() - sizeof(size_t)), size);
-        // record the new location of the object by storing it in the syncblock space.
-        *((size_t*)o - 1) = dst;
-
-        if (needToCopyMarks)
-        {
-            ((SatoriObject*)dst)->SetMarked();
-        }
-
-        relocationTarget->SetIndicesForObject((SatoriObject*)dst, dst + size);
-
-        dst += size;
-        objectsRelocated++;
-        o = (SatoriObject*)(o->Start() + size);
-    } while (o->Start() < objLimit);
+    int32_t objectsRelocated = CopyMarkedObjects(relocationSource, relocationSource->FirstObject()->Start(),
+        relocationSource->Start() + Satori::REGION_SIZE_GRANULARITY, relocationTarget, &dst);
 
     size_t used = dst - dstOrig;
     // we have new marks, but have not swept at this point, so could use less.
@@ -4632,6 +4617,170 @@ void SatoriRecycler::RelocateRegion(SatoriRegion* relocationSource)
         // relocationSource happened to be empty
         FreeLogicallyEmptyRegion(relocationSource, /* hasMarks */ false);
     }
+}
+
+// Relocates the objects of a region more than half full in two parts. The objects that fit go to the free span
+// of an existing target, the rest go to a second target. Returns false, and changes nothing, when it cannot get
+// the targets or the work chunks for the finalizable trackers of the second part.
+bool SatoriRecycler::RelocateRegionInParts(SatoriRegion* relocationSource)
+{
+    // only forced compaction in gen2 relocates in parts, so no part goes to a higher generation.
+    _ASSERTE(m_condemnedGeneration == 2);
+
+    // a smaller first part would only split the region without filling much.
+    SatoriRegion* first = TryGetRelocationTarget(relocationSource->Occupancy() / 4, /* existingRegionOnly */ true);
+    if (!first)
+    {
+        return false;
+    }
+
+    // the objects that fit in the free span of the first target
+    size_t objLimit = relocationSource->Start() + Satori::REGION_SIZE_GRANULARITY;
+    size_t firstSpace = first->GetAllocRemaining();
+    size_t firstBytes = 0;
+    SatoriObject* o = relocationSource->FirstObject();
+    do
+    {
+        o = relocationSource->SkipUnmarked(o);
+        if (o->Start() >= objLimit || firstBytes + o->Size() > firstSpace)
+        {
+            break;
+        }
+
+        firstBytes += o->Size();
+        o = (SatoriObject*)(o->Start() + o->Size());
+    } while (o->Start() < objLimit);
+
+    size_t splitAddress = min(o->Start(), objLimit);
+    SatoriRegion* second = nullptr;
+    size_t secondBytes = 0;
+    SatoriWorkChunk* chunks = nullptr;
+    size_t dstFirst = 0;
+    size_t dstSecond = 0;
+    bool failed = firstBytes == 0;
+
+    if (!failed && splitAddress < objLimit)
+    {
+        // the occupancy may count more than the marked objects, so this is enough for the rest.
+        secondBytes = relocationSource->Occupancy() - firstBytes;
+        second = TryGetRelocationTarget(secondBytes, /* existingRegionOnly */ false);
+        failed = second == nullptr;
+
+        size_t finalizables = failed ? 0 : relocationSource->CountFinalizablesFrom(splitAddress);
+        for (size_t count = 0; count < finalizables; count += SatoriWorkChunk::Capacity())
+        {
+            SatoriWorkChunk* chunk = m_heap->Allocator()->GetWorkChunk();
+            if (!chunk)
+            {
+                failed = true;
+                break;
+            }
+
+            chunk->SetNext(chunks);
+            chunks = chunk;
+        }
+    }
+
+    if (!failed)
+    {
+        dstFirst = first->Allocate(firstBytes, /*zeroInitialize*/ false);
+        dstSecond = second ? second->Allocate(secondBytes, /*zeroInitialize*/ false) : 0;
+        failed = dstFirst == 0 || (second && dstSecond == 0);
+    }
+
+    if (failed)
+    {
+        if (chunks)
+        {
+            m_heap->Allocator()->ReturnWorkChunks(chunks);
+        }
+
+        if (second)
+        {
+            second->StopAllocating(dstSecond ? dstSecond : second->GetAllocStart());
+            AddRelocationTarget(second);
+        }
+
+        first->StopAllocating(dstFirst ? dstFirst : first->GetAllocStart());
+        AddRelocationTarget(first);
+        return false;
+    }
+
+    // the destinations are secured, transfer the finalization trackers
+    if (chunks)
+    {
+        second->TakeFinalizablesFrom(relocationSource, splitAddress, chunks);
+    }
+
+    first->TakeFinalizerInfoFrom(relocationSource);
+
+    size_t dst = dstFirst;
+    int32_t objectsRelocated = CopyMarkedObjects(relocationSource, relocationSource->FirstObject()->Start(), splitAddress, first, &dst);
+    _ASSERTE(dst - dstFirst == firstBytes);
+    first->StopAllocating(dst);
+    first->SetOccupancy(first->Occupancy(), first->ObjCount() + objectsRelocated);
+    AddRelocationTarget(first);
+
+    if (second)
+    {
+        dst = dstSecond;
+        objectsRelocated = CopyMarkedObjects(relocationSource, splitAddress, objLimit, second, &dst);
+        _ASSERTE(dst - dstSecond <= secondBytes);
+        second->StopAllocating(dst);
+        second->SetOccupancy(second->Occupancy(), second->ObjCount() + objectsRelocated);
+        AddRelocationTarget(second);
+    }
+
+    relocationSource->IsRelocated() = true;
+    m_relocatedRegions->Push(relocationSource);
+    return true;
+}
+
+// Copies the marked objects of the source that start in [start, end) to *dst in the target,
+// records their new locations, and moves *dst past them. Returns the number of objects copied.
+int32_t SatoriRecycler::CopyMarkedObjects(SatoriRegion* relocationSource, size_t start, size_t end, SatoriRegion* relocationTarget, size_t* dst)
+{
+    // the target is typically marked, unless it is freshly allocated or in a higher generation
+    // preserve marked state by copying marks
+    bool relocationIsPromotion = relocationTarget->Generation() > m_condemnedGeneration;
+    bool needToCopyMarks = !(relocationIsPromotion || relocationTarget->DoNotSweep());
+    _ASSERTE(relocationTarget->HasMarksSet() == needToCopyMarks);
+
+    size_t to = *dst;
+    int32_t objectsRelocated = 0;
+    SatoriObject* o = (SatoriObject*)start;
+    do
+    {
+        o = relocationSource->SkipUnmarked(o);
+        if (o->Start() >= end)
+        {
+            _ASSERTE(o->Start() == end);
+            break;
+        }
+
+        _ASSERTE(o->IsMarked());
+        _ASSERTE(!o->IsFree());
+        _ASSERTE(!o->IsUnmovable());
+
+        size_t size = o->Size();
+        memcpy((void*)(to - sizeof(size_t)), (void*)(o->Start() - sizeof(size_t)), size);
+        // record the new location of the object by storing it in the syncblock space.
+        *((size_t*)o - 1) = to;
+
+        if (needToCopyMarks)
+        {
+            ((SatoriObject*)to)->SetMarked();
+        }
+
+        relocationTarget->SetIndicesForObject((SatoriObject*)to, to + size);
+
+        to += size;
+        objectsRelocated++;
+        o = (SatoriObject*)(o->Start() + size);
+    } while (o->Start() < end);
+
+    *dst = to;
+    return objectsRelocated;
 }
 
 NOINLINE

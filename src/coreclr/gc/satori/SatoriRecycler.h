@@ -429,6 +429,8 @@ private:
     void Relocate();
     void RelocateWorker();
     void RelocateRegion(SatoriRegion* region);
+    bool RelocateRegionInParts(SatoriRegion* relocationSource);
+    int32_t CopyMarkedObjects(SatoriRegion* relocationSource, size_t start, size_t end, SatoriRegion* relocationTarget, size_t* dst);
     void FreeLogicallyEmptyRegion(SatoriRegion* curRegion, bool hasMarks);
     void FreeRelocatedRegionsWorker();
 

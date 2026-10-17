@@ -2785,6 +2785,60 @@ void SatoriRegion::TakeFinalizerInfoFrom(SatoriRegion* other)
     }
 }
 
+// Counts the finalizable trackers for objects at or above the address.
+size_t SatoriRegion::CountFinalizablesFrom(size_t address)
+{
+    size_t count = 0;
+    for (SatoriWorkChunk* chunk = m_finalizableTrackers; chunk; chunk = chunk->Next())
+    {
+        for (size_t i = 0; i < chunk->Count(); i++)
+        {
+            SatoriObject* finalizable = chunk->Item(i);
+            if (finalizable != nullptr && finalizable->Start() >= address)
+            {
+                count++;
+            }
+        }
+    }
+
+    return count;
+}
+
+// Takes the finalizable trackers of the objects of the other region at or above the address.
+// The chunks must have room for all of them.
+void SatoriRegion::TakeFinalizablesFrom(SatoriRegion* other, size_t address, SatoriWorkChunk* chunks)
+{
+    _ASSERTE(!other->HasPinnedObjects());
+    SatoriWorkChunk* dst = chunks;
+    for (SatoriWorkChunk* chunk = other->m_finalizableTrackers; chunk; chunk = chunk->Next())
+    {
+        for (size_t i = 0; i < chunk->Count(); i++)
+        {
+            SatoriObject* finalizable = chunk->Item(i);
+            if (finalizable != nullptr && finalizable->Start() >= address)
+            {
+                if (!dst->HasSpace())
+                {
+                    dst = dst->Next();
+                }
+
+                dst->Push(finalizable);
+                chunk->Item(i) = nullptr;
+            }
+        }
+    }
+
+    SatoriWorkChunk* tail = chunks;
+    while (tail->Next() != nullptr)
+    {
+        tail = tail->Next();
+    }
+
+    tail->SetNext(m_finalizableTrackers);
+    m_finalizableTrackers = chunks;
+    m_hasFinalizables = true;
+}
+
 void SatoriRegion::IndividuallyPromote()
 {
     _ASSERTE(m_generation == 1);
@@ -2883,6 +2937,21 @@ size_t SatoriRegion::ReclaimSizeIfRelocated(bool assumeFullGC)
 
     _ASSERTE(reclaim <= Satori::REGION_SIZE_GRANULARITY);
     return reclaim;
+}
+
+// how much unusable space is reclaimed if the objects of a region more than half full are relocated in parts
+// to free spans of other regions. Only up to 3/4 full, so that relocation copies at most 3 bytes for each byte
+// it reclaims.
+size_t SatoriRegion::ReclaimSizeIfRelocatedInParts()
+{
+    if (IsLarge() || HasPinnedObjects() || IsDemoted())
+        return 0;
+
+    if (Occupancy() <= Satori::REGION_SIZE_GRANULARITY / 2 ||
+        Occupancy() > Satori::REGION_SIZE_GRANULARITY / 4 * 3)
+        return 0;
+
+    return Satori::REGION_SIZE_GRANULARITY - Occupancy() - sizeof(SatoriRegion);
 }
 
 bool SatoriRegion::IsPreSweepCandidate(bool assumeFullGC)

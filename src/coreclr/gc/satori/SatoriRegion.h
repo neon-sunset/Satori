@@ -127,6 +127,7 @@ public:
     bool IsDemotionCandidate(bool nextGcIsFullGC);
     bool IsPromotionCandidate();
     size_t ReclaimSizeIfRelocated(bool assumeFullGC);
+    size_t ReclaimSizeIfRelocatedInParts();
 
     bool TryDemote(bool nextGcIsFullGc);
     bool IsDemoted();
@@ -164,6 +165,8 @@ public:
     SatoriObject* SkipUnmarked(SatoriObject* from, size_t upTo);
 
     void TakeFinalizerInfoFrom(SatoriRegion* other);
+    size_t CountFinalizablesFrom(size_t address);
+    void TakeFinalizablesFrom(SatoriRegion* other, size_t address, SatoriWorkChunk* chunks);
     void IndividuallyPromote();
     void UpdateFinalizableTrackers();
     void UpdatePointers();
